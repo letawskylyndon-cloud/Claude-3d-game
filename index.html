@@ -1170,7 +1170,6 @@ const GEO = {
   cylTaper: new THREE.CylinderGeometry(0.5, 0.4, 1, 8),
   cyl12: new THREE.CylinderGeometry(0.5, 0.5, 1, 12),
   sphere: new THREE.SphereGeometry(0.5, 10, 7),
-  sphereLow: new THREE.SphereGeometry(0.5, 6, 4),
   cone: new THREE.ConeGeometry(0.5, 1, 8),
   cone4: new THREE.ConeGeometry(0.5, 1, 4),
   plane: new THREE.PlaneGeometry(1, 1),
@@ -4347,6 +4346,13 @@ const Effects = (function () {
     for (let i = 0; i < _meshes.length; i++) {
       const m = _meshes[i];
       scene.attach(m);
+      // Each piece collides through its own centre, resting on its thinnest half-extent.
+      const geo = m.geometry;
+      if (!geo.boundingBox) geo.computeBoundingBox();
+      const bb = geo.boundingBox;
+      const hx = (bb.max.x - bb.min.x) * 0.5 * m.scale.x;
+      const hy = (bb.max.y - bb.min.y) * 0.5 * m.scale.y;
+      const hz = (bb.max.z - bb.min.z) * 0.5 * m.scale.z;
       const cx = m.position.x - e.x, cz = m.position.z - e.z;
       const cl = Math.sqrt(cx * cx + cz * cz) || 1;
       const out = randRange(D.outSpeed) * bossMul;
@@ -4357,7 +4363,8 @@ const Effects = (function () {
         vz: nz * power * 0.5 + (cz / cl) * out + rand(-1, 1),
         wx: rand(-1, 1) * D.spin, wy: rand(-1, 1) * D.spin, wz: rand(-1, 1) * D.spin,
         sx: m.scale.x, sy: m.scale.y, sz: m.scale.z,
-        r: Math.max(0.03, Math.min(m.scale.x, m.scale.y, m.scale.z) * 0.5),
+        lcx: (bb.min.x + bb.max.x) * 0.5, lcy: (bb.min.y + bb.max.y) * 0.5, lcz: (bb.min.z + bb.max.z) * 0.5,
+        r: Math.max(0.03, Math.min(hx, hy, hz)),
       });
     }
     debrisGroups.push(g);
@@ -4404,27 +4411,33 @@ const Effects = (function () {
         m.rotation.x += p.wx * dt;
         m.rotation.y += p.wy * dt;
         m.rotation.z += p.wz * dt;
-        if (m.position.y < p.r) {
-          m.position.y = p.r;
+        // world-space centre of the piece
+        _v1.set(p.lcx * m.scale.x, p.lcy * m.scale.y, p.lcz * m.scale.z).applyQuaternion(m.quaternion);
+        const cy = m.position.y + _v1.y;
+        if (cy < p.r) {
+          m.position.y += p.r - cy;
           if (p.vy < 0) { p.vy = -p.vy * D.bounce; if (p.vy < 0.6) p.vy = 0; }
           p.vx *= D.friction; p.vz *= D.friction;
           p.wx *= 0.7; p.wy *= 0.7; p.wz *= 0.7;
         }
-        const hd2 = m.position.x * m.position.x + m.position.z * m.position.z;
-        if (hd2 > wallLim * wallLim) {
-          const hd = Math.sqrt(hd2), wx = m.position.x / hd, wz = m.position.z / hd;
-          m.position.x = wx * wallLim; m.position.z = wz * wallLim;
+        const ccx = m.position.x + _v1.x, ccz = m.position.z + _v1.z;
+        const lim = wallLim - p.r;
+        const hd2 = ccx * ccx + ccz * ccz;
+        if (hd2 > lim * lim) {
+          const hd = Math.sqrt(hd2), wx = ccx / hd, wz = ccz / hd;
+          m.position.x -= wx * (hd - lim); m.position.z -= wz * (hd - lim);
           const vn = p.vx * wx + p.vz * wz;
           if (vn > 0) { p.vx -= 1.6 * vn * wx; p.vz -= 1.6 * vn * wz; }
         }
         for (let j = 0; j < pillars.length; j++) {
           const pl = pillars[j];
-          if (m.position.y > pl.height) continue;
-          const ox = m.position.x - pl.x, oz = m.position.z - pl.z;
+          if (m.position.y + _v1.y > pl.height) continue;
+          const ox = ccx - pl.x, oz = ccz - pl.z;
+          const need = pl.r + p.r;
           const od2 = ox * ox + oz * oz;
-          if (od2 < pl.r * pl.r && od2 > 1e-8) {
+          if (od2 < need * need && od2 > 1e-8) {
             const od = Math.sqrt(od2), wx = ox / od, wz = oz / od;
-            m.position.x = pl.x + wx * pl.r; m.position.z = pl.z + wz * pl.r;
+            m.position.x += wx * (need - od); m.position.z += wz * (need - od);
             const vn = p.vx * wx + p.vz * wz;
             if (vn < 0) { p.vx -= 1.6 * vn * wx; p.vz -= 1.6 * vn * wz; }
           }
@@ -5360,7 +5373,7 @@ function init() {
   }
 }
 
-// Small read-only handle for debugging from the console.
+// Debug handle for the browser console (also used by automated tests).
 window.__duskPit = {
   CONFIG: CONFIG, Game: Game, Time: Time, Input: Input, player: player, enemies: enemies, Waves: Waves, Tokens: Tokens,
   Effects: Effects, startWave: startWave, spawnEnemy: spawnEnemy, killEnemy: killEnemy, pickUpgrade: pickUpgrade,
