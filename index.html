@@ -105,6 +105,15 @@
   }
   .btn:hover { filter: brightness(1.1); transform: translateY(-1px); }
   .btn:disabled { filter: grayscale(1) brightness(0.6); cursor: default; }
+  .btn-small {
+    font-family: var(--ui-font); font-size: 13px; letter-spacing: 2px; color: var(--ink); cursor: pointer; margin-top: 12px;
+    background: rgba(16, 12, 26, 0.7); border: 1px solid var(--line); border-radius: 4px; padding: 6px 14px;
+  }
+  .btn-small:hover { background: rgba(40, 30, 56, 0.85); }
+  #fps-ind {
+    position: fixed; left: 10px; bottom: 8px; z-index: 50; font: 12px monospace; color: #cbd6ea;
+    background: rgba(10, 10, 18, 0.6); padding: 2px 6px; border-radius: 3px; pointer-events: none;
+  }
   .note { margin-top: 14px; font-size: 14px; color: #d8cdb8; max-width: 560px; line-height: 1.45; }
   .warn { color: #ffd27a; }
   h2.screen-title { font-family: var(--title-font); font-size: 52px; letter-spacing: 10px; margin: 0 0 10px; color: #ffe9c2; text-shadow: 0 4px 10px #000; }
@@ -185,11 +194,15 @@
     <b>Q / E</b><span>Rotate camera (fallback when the pointer can't be captured)</span>
     <b>Esc / P</b><span>Pause</span>
     <b>M</b><span>Mute</span>
+    <b>F</b><span>Show frame rate</span>
   </div>
   <button id="start-btn" class="btn" type="button">START</button>
+  <button id="gfx-btn" class="btn-small" type="button" title="Lower settings run faster on school and budget laptops">GRAPHICS: AUTO</button>
   <div class="note">Red means danger: glowing foes, red ground marks and red arrows at the screen edge are incoming attacks.</div>
   <div id="load-error" class="note warn hidden"></div>
 </div>
+
+<div id="fps-ind" class="hidden"></div>
 
 <div id="pause-screen" class="screen dim hidden">
   <h2 class="screen-title">PAUSED</h2>
@@ -221,12 +234,16 @@
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script>
+  // Offline / blocked-CDN fallback: a copy of three.min.js (r128) next to this file.
+  if (typeof THREE === 'undefined') document.write('<script src="three.min.js"><\/script>');
+</script>
+<script>
 (function () {
 'use strict';
 
 if (typeof THREE === 'undefined') {
   const err = document.getElementById('load-error');
-  err.textContent = 'Three.js could not be loaded from cdnjs.cloudflare.com. Check your internet connection and reload the page.';
+  err.textContent = 'Three.js could not be loaded. Connect to the internet, or put three.min.js (from the game\'s download page) in the same folder as this file, then reload.';
   err.classList.remove('hidden');
   document.getElementById('start-btn').disabled = true;
   return;
@@ -252,11 +269,45 @@ const CONFIG = {
 
   // ---- Rendering ----
   render: {
-    maxPixelRatio: 2,           // cap for devicePixelRatio
-    shadowMapSize: 2048,        // px, sun shadow map resolution
+    maxPixelRatio: 2,           // hard cap for devicePixelRatio (presets may cap lower)
     fov: 60,                    // deg, vertical field of view
     near: 0.1,                  // units
     far: 700,                   // units
+  },
+
+  // ---- Graphics quality ----
+  // Chosen once at load. 'auto' picks 'low' on integrated Intel / software GPUs
+  // and 4-core machines. The title-screen button cycles it (saved, then reloads).
+  graphics: {
+    presets: {
+      low: {
+        antialias: false,       // MSAA off (fill-rate bound GPUs)
+        maxPixelRatio: 1,       // never render above CSS resolution
+        startScale: 0.85,       // initial render scale (1 = full resolution)
+        minScale: 0.5,          // dynamic resolution floor
+        shadows: false,         // no shadow pass; soft blob shadows instead
+        shadowMapSize: 1024,    // px (unused when shadows are off)
+        torchLights: 0,         // point lights on the wall torches (0-6)
+        cheapShading: true,     // per-vertex Lambert instead of per-pixel Phong
+        particleScale: 0.5,     // multiplier on pooled particle counts
+      },
+      medium: {
+        antialias: false, maxPixelRatio: 1.25, startScale: 1, minScale: 0.6,
+        shadows: true, shadowMapSize: 1024, torchLights: 3, cheapShading: false, particleScale: 0.75,
+      },
+      high: {
+        antialias: true, maxPixelRatio: 2, startScale: 1, minScale: 0.7,
+        shadows: true, shadowMapSize: 2048, torchLights: 6, cheapShading: false, particleScale: 1,
+      },
+    },
+    noTorchLightBoost: 0.14,    // extra hemisphere intensity when no torch lights (scaled by how many are off)
+    // Dynamic resolution: lower the render scale when the frame rate sags.
+    sampleTime: 1.0,            // s, averaging window
+    scaleDownFps: 50,           // average fps below this lowers the scale
+    scaleUpFps: 58,             // average fps above this (for upHoldTime) raises it
+    upHoldTime: 4.0,            // s of smooth play before trying a higher scale
+    scaleStepDown: 0.1,         // render-scale step when lowering
+    scaleStepUp: 0.05,          // render-scale step when raising
   },
 
   // ---- Arena layout ----
@@ -277,7 +328,7 @@ const CONFIG = {
     ],
     pillarRadius: 1.45,         // units, collision radius (matches the base)
     pillarShaftRadius: 1.05,    // units, visual shaft radius (used for camera fade test)
-    torchAngles: [30, 90, 150, 210, 270, 330], // deg; each torch has one point light (max 6)
+    torchAngles: [30, 90, 150, 210, 270, 330], // deg; the graphics preset decides how many get a point light (max 6)
     torchHeight: 4.3,           // units
     torchLightIntensity: 1.35,  // point light base intensity
     torchLightDistance: 17,     // units, point light range
@@ -1045,6 +1096,10 @@ function onKeyDown(e) {
   if (code === 'Space' || code === 'ArrowUp' || code === 'ArrowDown' || code === 'ArrowLeft' || code === 'ArrowRight' || code === 'Tab') {
     e.preventDefault();
   }
+  if (code === 'KeyF') {
+    if (!e.repeat) UI.toggleFps();
+    return;
+  }
   if (code === 'KeyM') {
     if (!e.repeat) {
       const m = Sound.toggleMute();
@@ -1139,9 +1194,58 @@ function bindInputEvents() {
 // =====================================================================
 // SCENE — renderer, sky, lights, arena, wall, gates, torches, pillars
 // =====================================================================
+// ---- Graphics quality: resolved once, before the renderer exists ----
+const GFX_KEY = 'duskPit.graphics';
+const GFX_MODES = ['auto', 'low', 'medium', 'high'];
+
+function readGraphicsChoice() {
+  const m = /gfx=(\w+)/.exec(window.location.hash || '');
+  if (m && GFX_MODES.indexOf(m[1]) >= 0) return m[1];
+  try {
+    const v = window.localStorage.getItem(GFX_KEY);
+    if (GFX_MODES.indexOf(v) >= 0) return v;
+  } catch (err) { /* storage blocked: fall back to auto */ }
+  return 'auto';
+}
+
+// Guess a preset from the GPU name and core count; dynamic resolution
+// corrects any misjudgement at runtime.
+function detectGraphicsLevel() {
+  try {
+    const c = document.createElement('canvas');
+    const gl = c.getContext('webgl') || c.getContext('experimental-webgl');
+    if (!gl) return 'low';
+    let name = String(gl.getParameter(gl.RENDERER) || '');
+    if (/^webkit|^mozilla|^$/i.test(name)) {
+      const ext = gl.getExtension('WEBGL_debug_renderer_info');
+      if (ext) name = String(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) || name);
+    }
+    name = name.toLowerCase();
+    const cores = window.navigator.hardwareConcurrency || 4;
+    if (/swiftshader|llvmpipe|softpipe|software|basic render/.test(name)) return 'low';
+    if (/intel/.test(name)) return (/iris|arc/.test(name) && cores >= 8) ? 'medium' : 'low';
+    if (/mali|adreno|powervr|videocore/.test(name)) return 'low';
+    if (cores <= 4) return 'low';
+    if (/nvidia|geforce|quadro|radeon|apple m/.test(name)) return 'high';
+    return 'medium';
+  } catch (err) {
+    return 'medium';
+  }
+}
+
+const GFX = (function () {
+  const choice = readGraphicsChoice();
+  const level = choice === 'auto' ? detectGraphicsLevel() : choice;
+  const preset = CONFIG.graphics.presets[level];
+  return {
+    choice: choice, level: level, preset: preset,
+    scale: preset.startScale,   // current dynamic render scale
+  };
+})();
+
 let renderer;
 try {
-  renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true, powerPreference: 'high-performance' });
+  renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: GFX.preset.antialias, powerPreference: 'high-performance' });
 } catch (err) {
   const el = document.getElementById('load-error');
   el.textContent = 'WebGL is not available in this browser, so the game cannot run.';
@@ -1149,9 +1253,12 @@ try {
   document.getElementById('start-btn').disabled = true;
   return;
 }
-renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, CONFIG.render.maxPixelRatio));
+function basePixelRatio() {
+  return Math.min(window.devicePixelRatio || 1, CONFIG.render.maxPixelRatio, GFX.preset.maxPixelRatio);
+}
+renderer.setPixelRatio(basePixelRatio() * GFX.scale);
 renderer.setSize(window.innerWidth, window.innerHeight, false);
-renderer.shadowMap.enabled = true;
+renderer.shadowMap.enabled = GFX.preset.shadows;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
 const scene = new THREE.Scene();
@@ -1476,14 +1583,17 @@ sky.frustumCulled = false;
 scene.add(sky);
 
 // ---- Lights: warm low sun (only shadow caster), cool fill, hemisphere ----
-const hemi = new THREE.HemisphereLight(CONFIG.colors.hemiSky, CONFIG.colors.hemiGround, 0.62);
+// Presets with fewer torch lights get a slightly brighter fill instead.
+const torchLightCount = Math.max(0, Math.min(6, GFX.preset.torchLights, CONFIG.arena.torchAngles.length));
+const hemi = new THREE.HemisphereLight(CONFIG.colors.hemiSky, CONFIG.colors.hemiGround,
+  0.62 + CONFIG.graphics.noTorchLightBoost * (1 - torchLightCount / 6));
 scene.add(hemi);
 const sun = new THREE.DirectionalLight(CONFIG.colors.sunLight, 1.35);
 const SUN_DIST = 70;
 sun.position.copy(lightSunDir).multiplyScalar(SUN_DIST);
 sun.target.position.set(0, 0, 0);
-sun.castShadow = true;
-sun.shadow.mapSize.set(CONFIG.render.shadowMapSize, CONFIG.render.shadowMapSize);
+sun.castShadow = GFX.preset.shadows;
+sun.shadow.mapSize.set(GFX.preset.shadowMapSize, GFX.preset.shadowMapSize);
 {
   // Fit the orthographic shadow camera tightly around the arena (wall included).
   const extent = ARENA_R + CONFIG.arena.wallThickness + 1.5;
@@ -1678,10 +1788,14 @@ const torches = [];
     glow.scale.set(2.6, 2.6, 1);
     glow.position.set(0, 0.55, 0);
     flame.add(glow);
-    const light = new THREE.PointLight(CONFIG.colors.torchLight, A.torchLightIntensity, A.torchLightDistance, 2);
-    light.position.set(cx * (ARENA_R - 1.3), A.torchHeight + 0.5, cz * (ARENA_R - 1.3));
-    light.castShadow = false;
-    scene.add(light);
+    // Spread the preset's point lights evenly over the torches.
+    let light = null;
+    if (Math.floor((i + 1) * torchLightCount / count) > Math.floor(i * torchLightCount / count)) {
+      light = new THREE.PointLight(CONFIG.colors.torchLight, A.torchLightIntensity, A.torchLightDistance, 2);
+      light.position.set(cx * (ARENA_R - 1.3), A.torchHeight + 0.5, cz * (ARENA_R - 1.3));
+      light.castShadow = false;
+      scene.add(light);
+    }
     torches.push({ flame: flame, light: light, seed: Math.random() * 100 });
   }
 })();
@@ -1691,7 +1805,7 @@ function updateTorches(t) {
   for (let i = 0; i < torches.length; i++) {
     const tc = torches[i];
     const n = Math.sin(t * 9.1 + tc.seed) * 0.45 + Math.sin(t * 23.7 + tc.seed * 2.3) * 0.35 + Math.sin(t * 4.3 + tc.seed * 0.7) * 0.2;
-    tc.light.intensity = A.torchLightIntensity * (1 - A.torchFlicker * 0.5 + A.torchFlicker * 0.5 * n);
+    if (tc.light) tc.light.intensity = A.torchLightIntensity * (1 - A.torchFlicker * 0.5 + A.torchFlicker * 0.5 * n);
     tc.flame.scale.set(1 + n * 0.08, 1 + n * 0.18, 1 + n * 0.08);
     tc.flame.rotation.y = t * 1.3 + tc.seed;
   }
@@ -1751,7 +1865,18 @@ function hasLineOfSight(ax, az, bx, bz, pad) {
 // hips and knees, built from shared primitives; animated procedurally.
 // Local +Z is forward, +X is the character's left, -X its right.
 // =====================================================================
+// Character material. The low preset swaps per-pixel Phong for per-vertex
+// Lambert (no specular), which is far cheaper on weak integrated GPUs.
 function phong(color, extra) {
+  if (GFX.preset.cheapShading) {
+    const m = new THREE.MeshLambertMaterial({ color: color });
+    if (extra) {
+      const vals = {};
+      for (const k in extra) if (k !== 'shininess' && k !== 'specular') vals[k] = extra[k];
+      m.setValues(vals);
+    }
+    return m;
+  }
   const m = new THREE.MeshPhongMaterial({ color: color, flatShading: true, shininess: 14, specular: 0x202020 });
   if (extra) m.setValues(extra);
   return m;
@@ -4113,8 +4238,8 @@ const Effects = (function () {
     scene.add(ps.points);
     return ps;
   }
-  const sparks = makeSystem(E.maxSparks, true, 0.15, 'spark');
-  const dusts = makeSystem(E.maxDust, false, 0.05, 'dust');
+  const sparks = makeSystem(Math.round(E.maxSparks * GFX.preset.particleScale), true, 0.15, 'spark');
+  const dusts = makeSystem(Math.round(E.maxDust * GFX.preset.particleScale), false, 0.05, 'dust');
 
   function emit(ps, x, y, z, vx, vy, vz, life, size, hex, gravity) {
     const i = ps.cursor;
@@ -4796,6 +4921,52 @@ const Effects = (function () {
   };
 })();
 
+
+// ---- Blob shadows: soft dark discs under characters when the graphics
+// preset turns real shadows off. One instanced draw call for everyone. ----
+const BlobShadows = (function () {
+  if (GFX.preset.shadows) return { update: function () {} };
+  const MAX = 32;
+  const c = document.createElement('canvas');
+  c.width = c.height = 64;
+  const g = c.getContext('2d');
+  const rg = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  rg.addColorStop(0, 'rgba(0,0,0,1)');
+  rg.addColorStop(0.5, 'rgba(0,0,0,0.75)');
+  rg.addColorStop(1, 'rgba(0,0,0,0)');
+  g.fillStyle = rg;
+  g.fillRect(0, 0, 64, 64);
+  const mat = new THREE.MeshBasicMaterial({
+    map: new THREE.CanvasTexture(c), color: 0x140a0c, transparent: true, opacity: 0.8, depthWrite: false,
+    polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
+  });
+  const mesh = new THREE.InstancedMesh(GEO.groundPlane, mat, MAX);
+  mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  mesh.frustumCulled = false;
+  mesh.renderOrder = 1;
+  mesh.count = 0;
+  scene.add(mesh);
+  const m4 = new THREE.Matrix4();
+
+  function put(n, x, z, r, lift) {
+    const s = r * 3 * Math.max(0.5, 1 - lift * 0.25);
+    m4.makeScale(s, 1, s);
+    m4.setPosition(x, 0.03, z);
+    mesh.setMatrixAt(n, m4);
+    return n + 1;
+  }
+  function update() {
+    let n = 0;
+    n = put(n, player.x, player.z, player.radius, player.rig.root.position.y);
+    for (let i = 0; i < enemies.length && n < MAX; i++) {
+      const e = enemies[i];
+      if (e.alive) n = put(n, e.x, e.z, e.radius, e.rig.root.position.y);
+    }
+    mesh.count = n;
+    mesh.instanceMatrix.needsUpdate = true;
+  }
+  return { update: update };
+})();
 // =====================================================================
 // UI — HUD, banners, damage numbers, off-screen telegraph arrows, screens
 // =====================================================================
@@ -4811,7 +4982,7 @@ const UI = (function () {
     title: $('title-screen'), pause: $('pause-screen'), pauseInstr: $('pause-instr'), pauseNote: $('pause-note'),
     upgrade: $('upgrade-screen'), upgTitle: $('upg-title'), cards: document.querySelectorAll('#cards .card'),
     gameover: $('gameover-screen'), goWaves: $('go-waves'), goKills: $('go-kills'), goBest: $('go-best'),
-    startBtn: $('start-btn'), resumeBtn: $('resume-btn'), restartBtn: $('restart-btn'),
+    startBtn: $('start-btn'), gfxBtn: $('gfx-btn'), fpsInd: $('fps-ind'), resumeBtn: $('resume-btn'), restartBtn: $('restart-btn'),
   };
   const s = {
     hpTrail: 1, hpDelay: 0, bossTrail: 1, bossDelay: 0, lastBossHp: -1,
@@ -4844,6 +5015,8 @@ const UI = (function () {
     el.startBtn.addEventListener('click', function () { el.startBtn.blur(); startGame(); });
     el.resumeBtn.addEventListener('click', function () { el.resumeBtn.blur(); requestResume(); });
     el.restartBtn.addEventListener('click', function () { el.restartBtn.blur(); restartGame(); });
+    el.gfxBtn.addEventListener('click', cycleGraphics);
+    el.gfxBtn.textContent = 'GRAPHICS: ' + (GFX.choice === 'auto' ? 'AUTO (' + GFX.level.toUpperCase() + ')' : GFX.level.toUpperCase());
     for (let i = 0; i < el.cards.length; i++) {
       const idx = i;
       el.cards[i].addEventListener('click', function () { pickUpgrade(idx); });
@@ -4873,6 +5046,32 @@ const UI = (function () {
   }
   function setPauseNote(msg) { el.pauseNote.textContent = msg || ''; }
   function setMuted(m) { el.muteInd.classList.toggle('hidden', !m); }
+
+  // Quality is baked into shaders and the renderer, so a change saves and reloads.
+  function cycleGraphics() {
+    const next = GFX_MODES[(GFX_MODES.indexOf(GFX.choice) + 1) % GFX_MODES.length];
+    let saved = false;
+    try {
+      window.localStorage.setItem(GFX_KEY, next);
+      saved = window.localStorage.getItem(GFX_KEY) === next;
+    } catch (err) { /* storage blocked: carry the choice in the URL instead */ }
+    el.gfxBtn.disabled = true;
+    try {
+      if (saved) {
+        if (/gfx=/.test(window.location.hash)) window.location.hash = '';
+      } else {
+        window.location.hash = 'gfx=' + next;
+      }
+      window.location.reload();
+    } catch (err) {
+      el.gfxBtn.disabled = false;
+    }
+  }
+  let fpsShown = false;
+  function toggleFps() { fpsShown = !fpsShown; el.fpsInd.classList.toggle('hidden', !fpsShown); }
+  function setFps(fps, scale) {
+    if (fpsShown) el.fpsInd.textContent = Math.round(fps) + ' fps · ' + GFX.level + ' · ' + Math.round(scale * 100) + '% res';
+  }
 
   function banner(main, sub, dur) {
     el.bannerMain.textContent = main;
@@ -5072,6 +5271,7 @@ const UI = (function () {
     init: init, update: update, onStateChange: onStateChange, banner: banner, toast: toast, flashEdge: flashEdge,
     damageNumber: damageNumber, setWave: setWave, showBoss: showBoss, showUpgrades: showUpgrades, hideUpgrades: hideUpgrades,
     showGameOver: showGameOver, resetHUD: resetHUD, setPauseNote: setPauseNote, refreshModeHints: refreshModeHints, setMuted: setMuted,
+    toggleFps: toggleFps, setFps: setFps,
   };
 })();
 
@@ -5308,8 +5508,47 @@ function tick(realDt) {
     blendPose(player.pose, player.poseTgt, 10, realDt);
     applyPose(player.rig, player.pose);
   }
+  BlobShadows.update();
   sky.position.copy(camera.position);
   UI.update(realDt);
+}
+
+// ---- Dynamic resolution: trade sharpness for frame rate on slow GPUs ----
+const Perf = {
+  acc: 0, frames: 0, smoothT: 0, fps: 60,
+  sample: function (rawDt) {
+    // Ignore stalls (tab switches, alerts) and frames while the game is paused.
+    if (!(rawDt > 0) || rawDt > 0.25 || document.hidden) return;
+    this.acc += rawDt;
+    this.frames++;
+    const G = CONFIG.graphics;
+    if (this.acc < G.sampleTime) return;
+    this.fps = this.frames / this.acc;
+    const window_ = this.acc;
+    this.acc = 0;
+    this.frames = 0;
+    UI.setFps(this.fps, GFX.scale);
+    if (Game.state !== 'playing' && Game.state !== 'title') return;
+    if (this.fps < G.scaleDownFps) {
+      this.smoothT = 0;
+      setRenderScale(GFX.scale - G.scaleStepDown);
+    } else if (this.fps >= G.scaleUpFps) {
+      this.smoothT += window_;
+      if (this.smoothT >= G.upHoldTime) {
+        this.smoothT = 0;
+        setRenderScale(GFX.scale + G.scaleStepUp);
+      }
+    } else {
+      this.smoothT = 0;
+    }
+  },
+};
+
+function setRenderScale(v) {
+  const next = clamp(v, GFX.preset.minScale, 1);
+  if (Math.abs(next - GFX.scale) < 1e-3) return;
+  GFX.scale = next;
+  onResize();
 }
 
 let errorReports = 0;
@@ -5326,6 +5565,7 @@ function frame(now) {
   requestAnimationFrame(frame);
   let realDt = (now - lastFrameTime) / 1000;
   lastFrameTime = now;
+  Perf.sample(realDt);
   if (!(realDt > 0)) realDt = 0;
   if (realDt > CONFIG.time.maxDelta) realDt = CONFIG.time.maxDelta;
   try {
@@ -5338,7 +5578,7 @@ function frame(now) {
 
 function onResize() {
   const w = Math.max(1, window.innerWidth), h = Math.max(1, window.innerHeight);
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, CONFIG.render.maxPixelRatio));
+  renderer.setPixelRatio(basePixelRatio() * GFX.scale);
   renderer.setSize(w, h, false);
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
@@ -5379,7 +5619,7 @@ window.__duskPit = {
   Effects: Effects, startWave: startWave, spawnEnemy: spawnEnemy, killEnemy: killEnemy, pickUpgrade: pickUpgrade,
   pauseGame: pauseGame, resumeGame: resumeGame, playerTakeDamage: playerTakeDamage, onPointerLockChange: onPointerLockChange,
   onLockFailed: onLockFailed, requestLock: requestLock, switchToNoLock: switchToNoLock, Cam: Cam, pillars: pillars, renderer: renderer,
-  meleeCap: meleeCap, pressAction: pressAction,
+  meleeCap: meleeCap, pressAction: pressAction, GFX: GFX, Perf: Perf, setRenderScale: setRenderScale,
   step: function (frames, dt) { for (let i = 0; i < frames; i++) tick(dt || 1 / 60); },
 };
 
