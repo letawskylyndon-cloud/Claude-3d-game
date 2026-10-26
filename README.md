@@ -11,7 +11,8 @@ statically. It loads Three.js r128 from cdnjs; all models, textures and sounds a
 1. Download `index.html` **and** `three.min.js` into the same folder. The game uses the local
    `three.min.js` whenever the CDN is blocked or there is no internet.
 2. Double-click `index.html` to open it in Chrome or Edge. Plug the laptop in, because battery
-   saver throttles the GPU.
+   saver throttles the GPU. Also turn off Chrome's **Energy Saver** (Settings → Performance), which
+   caps the frame rate at 30 fps, or Edge's **Efficiency mode**, which can also slow the game.
 
 Graphics adapt to the machine automatically:
 
@@ -19,7 +20,13 @@ Graphics adapt to the machine automatically:
   no shadow pass (soft blob shadows instead), no torch point lights, cheaper per-vertex shading,
   fewer particles, no anti-aliasing and a capped resolution.
 - **Dynamic resolution.** If the frame rate drops below 50 fps the game lowers its render
-  resolution, and it raises it again when there is headroom.
+  resolution, but keeps a lower resolution only when it actually raises the frame rate (on a
+  CPU-limited laptop it would just blur the picture). It raises resolution again when there is
+  headroom.
+- **Cheap to draw on every preset.** Each character is a single skinned mesh per material, so a
+  full wave costs about 50 draw calls instead of about 200. Enemy health bars and damage numbers
+  are each drawn in one instanced call. The heads-up display only animates compositor-friendly
+  properties, so getting hit costs no extra page repaints.
 - **Manual override.** The **GRAPHICS** button on the title screen cycles Auto / Low / Medium /
   High (the page reloads to apply it). Press **F** in game to show the frame rate.
 

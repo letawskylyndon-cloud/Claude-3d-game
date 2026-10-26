@@ -33,6 +33,8 @@
     background: rgba(10, 10, 18, 0.78); border: 2px solid var(--line); border-radius: 4px;
     overflow: hidden; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
   }
+  /* Bars shrink with transform: scaleX (compositor only, no layout or repaint). */
+  #hp-trail, #hp-fill, #boss-trail, #boss-fill { transform-origin: 0 50%; will-change: transform; }
   #hp-trail { position: absolute; left: 0; top: 0; bottom: 0; width: 100%; background: #fff0b0; }
   #hp-fill { position: absolute; left: 0; top: 0; bottom: 0; width: 100%; background: linear-gradient(#6ff2bb, #1f9e6c); }
   #hp-text { position: absolute; inset: 0; text-align: center; font-size: 12px; line-height: 16px; font-weight: bold; text-shadow: 0 1px 2px #000; }
@@ -65,22 +67,18 @@
     background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
     padding: 10px 18px; font-size: 14px; letter-spacing: 1px; opacity: 0; max-width: 80vw; text-align: center;
   }
+  /* Hurt vignette: a plain gradient on its own compositor layer, so fading it
+     only changes opacity (no per-frame repaint; a blurred box-shadow here
+     cost weak laptops half their frame rate on every hit). */
   #edge-flash {
-    position: absolute; inset: 0; opacity: 0;
-    box-shadow: inset 0 0 140px 40px rgba(255, 20, 10, 0.85);
-    background: radial-gradient(ellipse at center, rgba(255, 0, 0, 0) 55%, rgba(255, 20, 10, 0.35) 100%);
+    position: absolute; inset: 0; opacity: 0; visibility: hidden; will-change: opacity;
+    background: radial-gradient(ellipse at center, rgba(255, 20, 10, 0) 45%, rgba(255, 20, 10, 0.3) 72%, rgba(255, 20, 10, 0.85) 100%);
   }
   #offscreen .offarrow {
     position: absolute; left: 0; top: 0; width: 0; height: 0;
     border-top: 20px solid transparent; border-bottom: 20px solid transparent; border-left: 36px solid #ff2a1a;
-    filter: drop-shadow(0 0 6px rgba(255, 40, 20, 0.9)); display: none;
+    display: none; will-change: transform;
   }
-  #dmg-layer .dmg {
-    position: absolute; left: 0; top: 0; font-weight: 900; font-size: 22px; color: #fff;
-    text-shadow: 0 2px 0 #000, 0 0 6px rgba(0, 0, 0, 0.8); white-space: nowrap; display: none; will-change: transform, opacity;
-  }
-  #dmg-layer .dmg.big { font-size: 34px; color: #ffe07a; }
-  #dmg-layer .dmg.heal { color: #7dffc0; font-size: 20px; }
   #mute-ind { position: absolute; right: 24px; bottom: 20px; font-size: 13px; letter-spacing: 2px; color: #cbd6ea; opacity: 0.85; }
   #mode-hint { position: absolute; left: 24px; bottom: 20px; font-size: 13px; letter-spacing: 1px; color: #cbd6ea; opacity: 0.8; text-shadow: 0 1px 2px #000; }
 
@@ -176,7 +174,6 @@
   <div id="banner"><div id="banner-main"></div><div id="banner-sub"></div></div>
   <div id="edge-flash"></div>
   <div id="offscreen"></div>
-  <div id="dmg-layer"></div>
   <div id="toast"></div>
   <div id="mute-ind" class="hidden">MUTED (M)</div>
   <div id="mode-hint" class="hidden">Q / E: rotate camera &nbsp;·&nbsp; Esc / P: pause</div>
@@ -283,7 +280,7 @@ const CONFIG = {
       low: {
         antialias: false,       // MSAA off (fill-rate bound GPUs)
         maxPixelRatio: 1,       // never render above CSS resolution
-        startScale: 0.85,       // initial render scale (1 = full resolution)
+        startScale: 1,          // initial render scale (1 = full resolution)
         minScale: 0.5,          // dynamic resolution floor
         shadows: false,         // no shadow pass; soft blob shadows instead
         shadowMapSize: 1024,    // px (unused when shadows are off)
@@ -308,6 +305,8 @@ const CONFIG = {
     upHoldTime: 4.0,            // s of smooth play before trying a higher scale
     scaleStepDown: 0.1,         // render-scale step when lowering
     scaleStepUp: 0.05,          // render-scale step when raising
+    minGain: 0.06,              // a lower scale must raise fps by this fraction, else it is undone
+    retryTime: 30,              // s before lowering again after a step that did not help
   },
 
   // ---- Arena layout ----
@@ -600,7 +599,7 @@ const CONFIG = {
     maxDust: 320,               // pooled dust particles
     damageNumberLife: 0.85,     // s
     damageNumberRise: 1.4,      // units/s
-    damageNumbers: 40,          // pooled DOM elements
+    damageNumbers: 40,          // pooled damage numbers (drawn in WebGL)
     debris: {
       life: 2.4, fadeStart: 1.5, // s
       gravity: 24,              // units/s²
@@ -1194,6 +1193,17 @@ function bindInputEvents() {
 // =====================================================================
 // SCENE — renderer, sky, lights, arena, wall, gates, torches, pillars
 // =====================================================================
+// Hidden subtrees (pooled effects, inactive accessories: about a third of
+// the scene graph) skip the per-frame matrix update. They recompute on the
+// first frame they are visible again. Code that needs a hidden object's
+// matrices calls updateWorldMatrix(), which is unaffected.
+(function () {
+  const update = THREE.Object3D.prototype.updateMatrixWorld;
+  THREE.Object3D.prototype.updateMatrixWorld = function (force) {
+    if (this.visible) update.call(this, force);
+  };
+})();
+
 // ---- Graphics quality: resolved once, before the renderer exists ----
 const GFX_KEY = 'duskPit.graphics';
 const GFX_MODES = ['auto', 'low', 'medium', 'high'];
@@ -1369,11 +1379,18 @@ function mergeParts(entries) {
 
 // Merges recorded parts under `root` into one mesh per pivot and slot.
 // With a cacheKey the merged geometries are built once and shared.
+// With `skinned`, the whole rig becomes ONE skinned mesh per slot whose
+// bones are the pivots themselves (rigid, one bone per vertex), so a
+// character costs a draw call or two instead of one per limb.
 const MERGE_CACHE = {};
-function finishParts(root, slots, cacheKey, castShadow, receiveShadow) {
+function finishParts(root, slots, cacheKey, castShadow, receiveShadow, skinned) {
   const cache = cacheKey ? (MERGE_CACHE[cacheKey] || (MERGE_CACHE[cacheKey] = {})) : null;
   const groups = [];
   root.traverse(function (o) { if (o.userData.parts) groups.push(o); });
+  if (skinned) {
+    finishSkinned(root, groups, slots, cache, castShadow);
+    return;
+  }
   for (let gi = 0; gi < groups.length; gi++) {
     const g = groups[gi];
     const bySlot = {};
@@ -1398,6 +1415,105 @@ function finishParts(root, slots, cacheKey, castShadow, receiveShadow) {
     }
     delete g.userData.parts;
   }
+}
+
+// Builds one geometry for a slot from per-pivot merged geometries, moved
+// into rig space by each pivot's bind transform and bound to that pivot.
+function buildSkinnedGeometry(list, binds) {
+  let vCount = 0, iCount = 0;
+  for (let i = 0; i < list.length; i++) {
+    vCount += list[i].geo.attributes.position.count;
+    iCount += list[i].geo.index.count;
+  }
+  const pos = new Float32Array(vCount * 3), nor = new Float32Array(vCount * 3), col = new Float32Array(vCount * 3), uv = new Float32Array(vCount * 2);
+  const skinIndex = new Uint16Array(vCount * 4), skinWeight = new Float32Array(vCount * 4);
+  const idx = vCount > 65535 ? new Uint32Array(iCount) : new Uint16Array(iCount);
+  let vo = 0, io = 0;
+  for (let i = 0; i < list.length; i++) {
+    const g = list[i].geo, bone = list[i].bone, B = binds[bone];
+    _mNorm.getNormalMatrix(B);
+    const pa = g.attributes.position, na = g.attributes.normal, ca = g.attributes.color, ua = g.attributes.uv;
+    for (let v = 0; v < pa.count; v++) {
+      const o = vo + v;
+      _mV.fromBufferAttribute(pa, v).applyMatrix4(B);
+      pos[o * 3] = _mV.x; pos[o * 3 + 1] = _mV.y; pos[o * 3 + 2] = _mV.z;
+      _mV.fromBufferAttribute(na, v).applyMatrix3(_mNorm).normalize();
+      nor[o * 3] = _mV.x; nor[o * 3 + 1] = _mV.y; nor[o * 3 + 2] = _mV.z;
+      col[o * 3] = ca.getX(v); col[o * 3 + 1] = ca.getY(v); col[o * 3 + 2] = ca.getZ(v);
+      uv[o * 2] = ua.getX(v); uv[o * 2 + 1] = ua.getY(v);
+      skinIndex[o * 4] = bone;
+      skinWeight[o * 4] = 1;
+    }
+    for (let k = 0; k < g.index.count; k++) idx[io++] = g.index.getX(k) + vo;
+    vo += pa.count;
+  }
+  const out = new THREE.BufferGeometry();
+  out.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  out.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+  out.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  out.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  out.setAttribute('skinIndex', new THREE.BufferAttribute(skinIndex, 4));
+  out.setAttribute('skinWeight', new THREE.BufferAttribute(skinWeight, 4));
+  out.setIndex(new THREE.BufferAttribute(idx, 1));
+  out.computeBoundingSphere();
+  // Culling uses the bind pose; leave room for swinging limbs and weapons.
+  out.boundingSphere.radius *= 1.4;
+  return out;
+}
+
+const _rootInv = new THREE.Matrix4();
+function finishSkinned(root, groups, slots, cache, castShadow) {
+  root.updateWorldMatrix(false, true);
+  _rootInv.copy(root.matrixWorld).invert();
+  // Bind transform of every pivot relative to the rig root.
+  const binds = [], boneInverses = [];
+  for (let gi = 0; gi < groups.length; gi++) {
+    const B = new THREE.Matrix4().multiplyMatrices(_rootInv, groups[gi].matrixWorld);
+    binds.push(B);
+    boneInverses.push(B.clone().invert());
+  }
+  // Per-pivot geometries are kept: dying enemies break apart into them.
+  const pieces = [], bySlot = {}, order = [];
+  for (let gi = 0; gi < groups.length; gi++) {
+    const parts = groups[gi].userData.parts;
+    const local = {}, localOrder = [];
+    for (let i = 0; i < parts.length; i++) {
+      const pt = parts[i];
+      if (!local[pt.slot]) { local[pt.slot] = []; localOrder.push(pt.slot); }
+      local[pt.slot].push(pt);
+    }
+    for (let k = 0; k < localOrder.length; k++) {
+      const slot = localOrder[k];
+      const key = gi + ':' + slot;
+      let geo = cache ? cache[key] : null;
+      if (!geo) {
+        geo = mergeParts(local[slot]);
+        if (cache) cache[key] = geo;
+      }
+      pieces.push({ bone: gi, slot: slot, geo: geo });
+      if (!bySlot[slot]) { bySlot[slot] = []; order.push(slot); }
+      bySlot[slot].push({ bone: gi, geo: geo });
+    }
+    delete groups[gi].userData.parts;
+  }
+  const skeleton = new THREE.Skeleton(groups, boneInverses);
+  const meshes = [];
+  for (let k = 0; k < order.length; k++) {
+    const slot = order[k];
+    const key = 'skin:' + slot;
+    let geo = cache ? cache[key] : null;
+    if (!geo) {
+      geo = buildSkinnedGeometry(bySlot[slot], binds);
+      if (cache) cache[key] = geo;
+    }
+    slots[slot].skinning = true;
+    const mesh = new THREE.SkinnedMesh(geo, slots[slot]);
+    mesh.castShadow = castShadow !== false;
+    root.add(mesh);
+    mesh.bind(skeleton, new THREE.Matrix4());
+    meshes.push(mesh);
+  }
+  root.userData.skin = { bones: groups, pieces: pieces, meshes: meshes, slots: slots };
 }
 
 
@@ -1860,6 +1976,20 @@ function hasLineOfSight(ax, az, bx, bz, pad) {
   return true;
 }
 
+// Everything built so far is static scenery: compute its matrices once and
+// let the per-frame update skip it. Only the sky (it follows the camera) and
+// the flickering torch flames keep updating.
+(function freezeStaticScenery() {
+  const dynamic = new Set([sky]);
+  for (let i = 0; i < torches.length; i++) dynamic.add(torches[i].flame);
+  scene.traverse(function (o) {
+    if (dynamic.has(o)) return;
+    o.updateMatrix();
+    o.matrixAutoUpdate = false;
+  });
+  scene.updateWorldMatrix(false, true);
+})();
+
 // =====================================================================
 // CHARACTERS — nested groups with pivots at shoulders, elbows, wrists,
 // hips and knees, built from shared primitives; animated procedurally.
@@ -2003,7 +2133,7 @@ function buildKnight() {
   cape.position.set(0, 0.5, -0.15);
   rig.torso.add(cape);
   part(cape, GEO.box, C.cape, [0.44, 0.84, 0.025], [0, -0.42, 0]);
-  finishParts(rig.root, { body: body, blade: blade }, 'knight');
+  finishParts(rig.root, { body: body, blade: blade }, 'knight', true, false, true);
   rig.cape = cape;
   rig.sword = sword;
   rig.swordTip = tip;
@@ -2067,7 +2197,7 @@ function buildGrunt() {
   rig.handR.add(weapon);
   part(weapon, GEO.cyl, C.cloth, [0.05, 0.2, 0.05], [0, 0, 0]);
   part(weapon, GEO.box, C.metal, [0.04, 0.52, 0.17], [0, -0.36, 0.05]);
-  finishParts(rig.root, { body: body }, 'grunt');
+  finishParts(rig.root, { body: body }, 'grunt', true, false, true);
   return { rig: rig, mats: [body] };
 }
 
@@ -2134,7 +2264,7 @@ function buildBrute(isBoss) {
       part(weapon, GEO.cone4, C.bone, [0.08, 0.22, 0.08], [Math.sin(a) * 0.17, -0.85, Math.cos(a) * 0.17], [Math.cos(a) * 1.4, 0, -Math.sin(a) * 1.4]);
     }
   }
-  finishParts(rig.root, { body: body }, isBoss ? 'boss' : 'brute');
+  finishParts(rig.root, { body: body }, isBoss ? 'boss' : 'brute', true, false, true);
   const stars = makeStunStars(rig.root, 2.55);
   return { rig: rig, mats: [body], stars: stars };
 }
@@ -2180,7 +2310,7 @@ function buildArcher() {
   part(bowPivot, GEO.box, archerEyeMat, [0.012, 0.95, 0.012], [-0.345, 0, 0], null, true);
   const nock = part(bowPivot, GEO.cyl, nockMat, [0.025, 0.62, 0.025], [-0.04, 0, 0], [0, 0, Math.PI / 2], true);
   nock.visible = false;
-  finishParts(rig.root, { body: body }, 'archer');
+  finishParts(rig.root, { body: body }, 'archer', true, false, true);
   return { rig: rig, mats: [body], nock: nock };
 }
 
@@ -3276,47 +3406,90 @@ const ENEMY_ATTACK_STATES = {
 };
 
 // ---- Floating health bars (shared materials, face the camera) ----
-const barBgMat = new THREE.MeshBasicMaterial({ color: CONFIG.colors.barBg, transparent: true, opacity: 0.72, depthTest: false, depthWrite: false, fog: false });
-const barTrailMat = new THREE.MeshBasicMaterial({ color: CONFIG.colors.barTrail, transparent: true, opacity: 0.9, depthTest: false, depthWrite: false, fog: false });
-const barFillMat = new THREE.MeshBasicMaterial({ color: CONFIG.colors.barFill, transparent: true, opacity: 1, depthTest: false, depthWrite: false, fog: false });
+// ---- Enemy health bars: one billboard quad per bar, all drawn on top in a
+// single instanced call. Each instance carries its fill and trail ratios. ----
+const HealthBars = (function () {
+  const MAX = 32;
+  const geo = new THREE.PlaneGeometry(1, 1);
+  const barAttr = new THREE.InstancedBufferAttribute(new Float32Array(MAX * 3), 3).setUsage(THREE.DynamicDrawUsage);
+  geo.setAttribute('aBar', barAttr);
+  const C = CONFIG.colors;
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      uBg: { value: new THREE.Color(C.barBg) },
+      uTrail: { value: new THREE.Color(C.barTrail) },
+      uFill: { value: new THREE.Color(C.barFill) },
+    },
+    vertexShader: [
+      'attribute vec3 aBar;',      // x: fill ratio, y: trail ratio, z: border width in uv
+      'varying vec2 vUv;',
+      'varying vec3 vBar;',
+      'void main() {',
+      '  vUv = uv;',
+      '  vBar = aBar;',
+      '  gl_Position = projectionMatrix * modelViewMatrix * instanceMatrix * vec4(position, 1.0);',
+      '}',
+    ].join('\n'),
+    fragmentShader: [
+      'uniform vec3 uBg; uniform vec3 uTrail; uniform vec3 uFill;',
+      'varying vec2 vUv;',
+      'varying vec3 vBar;',
+      'void main() {',
+      '  vec4 c = vec4(uBg, 0.72);',
+      '  float x = (vUv.x - vBar.z) / (1.0 - 2.0 * vBar.z);',
+      '  if (x >= 0.0 && x <= 1.0 && vUv.y >= 0.206 && vUv.y <= 0.794) {',
+      '    if (x <= vBar.x) c = vec4(uFill, 1.0);',
+      '    else if (x <= vBar.y) c = vec4(uTrail, 0.9);',
+      '  }',
+      '  gl_FragColor = c;',
+      '}',
+    ].join('\n'),
+    transparent: true, depthTest: false, depthWrite: false,
+  });
+  const mesh = new THREE.InstancedMesh(geo, mat, MAX);
+  mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  mesh.frustumCulled = false;
+  mesh.renderOrder = 30;
+  mesh.count = 0;
+  scene.add(mesh);
+  const m4 = new THREE.Matrix4(), pos = new THREE.Vector3(), scl = new THREE.Vector3();
+
+  // Rebuild the instance list from the live enemies' bar state.
+  function flush() {
+    let n = 0;
+    for (let i = 0; i < enemies.length && n < MAX; i++) {
+      const e = enemies[i], b = e.bar;
+      if (!b || !b.show) continue;
+      const w = b.width + 0.08;
+      pos.set(e.x, e.def.height + 0.35, e.z);
+      scl.set(w, 0.17, 1);
+      m4.compose(pos, camera.quaternion, scl);
+      mesh.setMatrixAt(n, m4);
+      barAttr.setXYZ(n, b.ratio, b.trailRatio, 0.04 / w);
+      n++;
+    }
+    mesh.count = n;
+    mesh.instanceMatrix.needsUpdate = true;
+    barAttr.needsUpdate = true;
+  }
+  return { flush: flush, mesh: mesh };
+})();
+
 function createHealthBar(width) {
-  const group = new THREE.Group();
-  const bg = new THREE.Mesh(GEO.plane, barBgMat);
-  bg.scale.set(width + 0.08, 0.17, 1);
-  bg.renderOrder = 30;
-  const trail = new THREE.Mesh(GEO.plane, barTrailMat);
-  trail.scale.set(width, 0.1, 1);
-  trail.position.z = 0.001;
-  trail.renderOrder = 31;
-  const fill = new THREE.Mesh(GEO.plane, barFillMat);
-  fill.scale.set(width, 0.1, 1);
-  fill.position.z = 0.002;
-  fill.renderOrder = 32;
-  group.add(bg);
-  group.add(trail);
-  group.add(fill);
-  group.visible = false;
-  scene.add(group);
-  return { group: group, trail: trail, fill: fill, width: width, trailRatio: 1 };
+  return { width: width, ratio: 1, trailRatio: 1, show: false };
 }
 function updateHealthBar(e, dt) {
   const b = e.bar;
   if (!b) return;
   const ratio = clamp(e.hp / e.maxHp, 0, 1);
-  const show = ratio < 0.999;
-  b.group.visible = show;
-  if (!show) return;
+  b.show = ratio < 0.999;
+  b.ratio = ratio;
+  if (!b.show) return;
   if (b.trailRatio > ratio) {
     if (Time.sim - e.lastHitT > 0.3) b.trailRatio = Math.max(ratio, b.trailRatio - dt * 0.9);
   } else {
     b.trailRatio = ratio;
   }
-  b.fill.scale.x = Math.max(0.0001, b.width * ratio);
-  b.fill.position.x = -b.width * (1 - ratio) / 2;
-  b.trail.scale.x = Math.max(0.0001, b.width * b.trailRatio);
-  b.trail.position.x = -b.width * (1 - b.trailRatio) / 2;
-  b.group.position.set(e.x, e.def.height + 0.35, e.z);
-  b.group.quaternion.copy(camera.quaternion);
 }
 
 // ---- Spawning / removal ----
@@ -3389,12 +3562,19 @@ function disposeMaterials(list) {
   for (let i = 0; i < list.length; i++) list[i].dispose();
 }
 
+// Non-skinned copy of a character material for its death debris.
+function debrisMaterial(m) {
+  const c = m.clone();
+  c.skinning = false;
+  return c;
+}
+
 // Immediate removal without death effects (used when a run is reset).
 function destroyEnemy(e) {
   e.alive = false;
   releaseToken(e);
   if (e.marker) { Effects.releaseMarker(e.marker); e.marker = null; }
-  if (e.bar) { scene.remove(e.bar.group); e.bar = null; }
+  e.bar = null;
   scene.remove(e.rig.root);
   disposeMaterials(e.mats);
 }
@@ -3404,7 +3584,7 @@ function killEnemy(e, nx, nz, power) {
   setEnemyState(e, 'dead');
   e.alive = false;
   releaseToken(e);
-  if (e.bar) { scene.remove(e.bar.group); e.bar = null; }
+  e.bar = null;
   if (e.stars && e.stars.parent) e.stars.parent.remove(e.stars);
   e.stars = null;
   Effects.spawnDebris(e, nx, nz, power);
@@ -4463,14 +4643,31 @@ const Effects = (function () {
   function spawnDebris(e, nx, nz, power) {
     const D = E.debris;
     e.rig.squash.scale.set(1, 1, 1);
-    e.rig.root.updateMatrixWorld(true);
+    e.rig.root.updateWorldMatrix(false, true);
     _meshes.length = 0;
-    e.rig.root.traverseVisible(function (o) { if (o.isMesh) _meshes.push(o); });
-    const g = { pieces: [], mats: e.mats, baseColors: e.baseColors, t: 0, flashReset: false, fading: false };
+    // Loose accessories keep their own meshes and shared materials.
+    e.rig.root.traverseVisible(function (o) { if (o.isMesh && !o.isSkinnedMesh) _meshes.push(o); });
+    for (let i = 0; i < _meshes.length; i++) scene.attach(_meshes[i]);
+    // The skinned body breaks into one rigid piece per pivot and slot, placed
+    // where that limb was. Pieces use non-skinned copies of the enemy's
+    // materials (carrying the current flash), owned by the debris group.
+    const skin = e.rig.root.userData.skin;
+    const mats = e.mats.map(debrisMaterial);
+    disposeMaterials(e.mats);
+    for (let i = 0; i < skin.pieces.length; i++) {
+      const pc = skin.pieces[i];
+      const mi = e.mats.indexOf(skin.slots[pc.slot]);
+      if (mi < 0) continue;
+      const m = new THREE.Mesh(pc.geo, mats[mi]);
+      m.castShadow = true;
+      skin.bones[pc.bone].matrixWorld.decompose(m.position, m.quaternion, m.scale);
+      scene.add(m);
+      _meshes.push(m);
+    }
+    const g = { pieces: [], mats: mats, baseColors: e.baseColors, t: 0, flashReset: false, fading: false };
     const bossMul = e.isBoss ? 1.3 : 1;
     for (let i = 0; i < _meshes.length; i++) {
       const m = _meshes[i];
-      scene.attach(m);
       // Each piece collides through its own centre, resting on its thinnest half-extent.
       const geo = m.geometry;
       if (!geo.boundingBox) geo.computeBoundingBox();
@@ -4925,7 +5122,7 @@ const Effects = (function () {
 // ---- Blob shadows: soft dark discs under characters when the graphics
 // preset turns real shadows off. One instanced draw call for everyone. ----
 const BlobShadows = (function () {
-  if (GFX.preset.shadows) return { update: function () {} };
+  if (GFX.preset.shadows) return { update: function () {}, mesh: null };
   const MAX = 32;
   const c = document.createElement('canvas');
   c.width = c.height = 64;
@@ -4965,11 +5162,182 @@ const BlobShadows = (function () {
     mesh.count = n;
     mesh.instanceMatrix.needsUpdate = true;
   }
-  return { update: update };
+  return { update: update, mesh: mesh };
 })();
 // =====================================================================
 // UI — HUD, banners, damage numbers, off-screen telegraph arrows, screens
 // =====================================================================
+// ---- Damage numbers: glyph quads from a digit atlas, all drawn in one
+// instanced call on top of the scene. (As DOM text they cost weak laptops a
+// style, layout and paint pass every frame.) Sizes are in CSS pixels. ----
+const DamageText = (function () {
+  const MAXN = CONFIG.effects.damageNumbers;
+  const MAXG = MAXN * 5;
+  const CHARS = '0123456789+';
+  const F = 56, PAD = 9, CELL_H = F + PAD * 2;
+  const KINDS = {
+    '': { size: 22, color: new THREE.Color(0xffffff) },
+    big: { size: 34, color: new THREE.Color(0xffe07a) },
+    heal: { size: 20, color: new THREE.Color(0x7dffc0) },
+  };
+  // Atlas: white glyphs with a black outline and drop shadow; tinted per number.
+  const c = document.createElement('canvas');
+  const g = c.getContext('2d');
+  const font = '900 ' + F + 'px "Trebuchet MS", "Segoe UI", system-ui, sans-serif';
+  g.font = font;
+  const widths = [];
+  let atlasW = 0;
+  for (let i = 0; i < CHARS.length; i++) {
+    widths.push(Math.ceil(g.measureText(CHARS[i]).width));
+    atlasW += widths[i] + PAD * 2;
+  }
+  c.width = atlasW;
+  c.height = CELL_H;
+  g.font = font;
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  g.lineJoin = 'round';
+  const glyphs = {};
+  let gx = 0;
+  for (let i = 0; i < CHARS.length; i++) {
+    const cw = widths[i] + PAD * 2, cx = gx + cw / 2, cy = CELL_H / 2 + 1;
+    g.fillStyle = 'rgba(0,0,0,0.8)';
+    g.fillText(CHARS[i], cx, cy + 4);
+    g.strokeStyle = '#000';
+    g.lineWidth = 7;
+    g.strokeText(CHARS[i], cx, cy);
+    g.fillStyle = '#fff';
+    g.fillText(CHARS[i], cx, cy);
+    glyphs[CHARS[i]] = { u0: gx / atlasW, uw: cw / atlasW, cw: cw, adv: widths[i] };
+    gx += cw;
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.generateMipmaps = false;
+  tex.minFilter = THREE.LinearFilter;
+
+  const base = new THREE.PlaneGeometry(1, 1);
+  const geo = new THREE.InstancedBufferGeometry();
+  geo.setIndex(base.index);
+  geo.setAttribute('position', base.attributes.position);
+  geo.setAttribute('uv', base.attributes.uv);
+  function inst(size) {
+    const a = new THREE.InstancedBufferAttribute(new Float32Array(MAXG * size), size);
+    a.setUsage(THREE.DynamicDrawUsage);
+    return a;
+  }
+  const aAnchor = inst(3), aGlyph = inst(4), aUv = inst(2), aColor = inst(3);
+  geo.setAttribute('aAnchor', aAnchor);   // world position of the number
+  geo.setAttribute('aGlyph', aGlyph);     // x offset px, width px, height px, alpha
+  geo.setAttribute('aUv', aUv);           // atlas u start, u width
+  geo.setAttribute('aColor', aColor);
+  geo.instanceCount = 0;
+  const viewport = new THREE.Vector2(1, 1);
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { uMap: { value: tex }, uViewport: { value: viewport } },
+    vertexShader: [
+      'uniform vec2 uViewport;',
+      'attribute vec3 aAnchor; attribute vec4 aGlyph; attribute vec2 aUv; attribute vec3 aColor;',
+      'varying vec2 vUv; varying vec4 vColor;',
+      'void main() {',
+      '  vec4 clip = projectionMatrix * viewMatrix * vec4(aAnchor, 1.0);',
+      '  vec2 px = vec2(aGlyph.x + position.x * aGlyph.y, position.y * aGlyph.z);',
+      '  clip.xy += px * 2.0 / uViewport * clip.w;',
+      '  gl_Position = clip;',
+      '  vUv = vec2(aUv.x + uv.x * aUv.y, uv.y);',
+      '  vColor = vec4(aColor, aGlyph.w);',
+      '}',
+    ].join('\n'),
+    fragmentShader: [
+      'uniform sampler2D uMap;',
+      'varying vec2 vUv; varying vec4 vColor;',
+      'void main() {',
+      '  vec4 t = texture2D(uMap, vUv);',
+      '  gl_FragColor = vec4(t.rgb * vColor.rgb, t.a * vColor.a);',
+      '}',
+    ].join('\n'),
+    transparent: true, depthTest: false, depthWrite: false,
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.frustumCulled = false;
+  mesh.renderOrder = 40;
+  mesh.visible = false;
+  scene.add(mesh);
+
+  const pool = [];
+  for (let i = 0; i < MAXN; i++) pool.push({ active: false, x: 0, y: 0, z: 0, life: 0, maxLife: 1, text: '', kind: KINDS[''] });
+  let shown = false;
+  const _p = new THREE.Vector3();
+
+  function spawn(x, y, z, value, kind) {
+    let d = null;
+    for (let i = 0; i < pool.length; i++) if (!pool[i].active) { d = pool[i]; break; }
+    if (!d) {
+      d = pool[0];
+      for (let i = 1; i < pool.length; i++) if (pool[i].life < d.life) d = pool[i];
+    }
+    d.active = true;
+    d.x = x + rand(-0.25, 0.25);
+    d.y = y;
+    d.z = z + rand(-0.25, 0.25);
+    d.maxLife = CONFIG.effects.damageNumberLife * (kind === 'big' ? 1.2 : 1);
+    d.life = d.maxLife;
+    d.text = String(value).slice(0, 5);
+    d.kind = KINDS[kind] || KINDS[''];
+  }
+
+  function update(dt) {
+    let n = 0;
+    for (let i = 0; i < pool.length; i++) {
+      const d = pool[i];
+      if (!d.active) continue;
+      d.life -= dt;
+      if (d.life <= 0) { d.active = false; continue; }
+      d.y += CONFIG.effects.damageNumberRise * dt;
+      _p.set(d.x, d.y, d.z).project(camera);
+      if (_p.z > 1) continue;                       // behind the camera
+      const age = 1 - d.life / d.maxLife;
+      const pop = age < 0.12 ? 1.7 - (age / 0.12) * 0.7 : 1;
+      const alpha = Math.min(1, (d.life / d.maxLife) * 2.2);
+      const k = d.kind.size * pop / F;              // atlas px -> screen px
+      let total = 0;
+      for (let j = 0; j < d.text.length; j++) { const gl = glyphs[d.text[j]]; if (gl) total += gl.adv; }
+      let cursor = -total * k / 2;
+      for (let j = 0; j < d.text.length; j++) {
+        const gl = glyphs[d.text[j]];
+        if (!gl) continue;
+        aAnchor.setXYZ(n, d.x, d.y, d.z);
+        aGlyph.setXYZW(n, cursor + gl.adv * k / 2, gl.cw * k, CELL_H * k, alpha);
+        aUv.setXY(n, gl.u0, gl.uw);
+        aColor.setXYZ(n, d.kind.color.r, d.kind.color.g, d.kind.color.b);
+        cursor += gl.adv * k;
+        n++;
+      }
+    }
+    geo.instanceCount = n;
+    mesh.visible = shown && n > 0;
+    if (n > 0) {
+      aAnchor.needsUpdate = aGlyph.needsUpdate = aUv.needsUpdate = aColor.needsUpdate = true;
+      viewport.set(Math.max(1, window.innerWidth), Math.max(1, window.innerHeight));
+    }
+  }
+
+  function clear() {
+    for (let i = 0; i < pool.length; i++) pool[i].active = false;
+    geo.instanceCount = 0;
+    mesh.visible = false;
+  }
+  // Only drawn while playing, so numbers never show through menu overlays.
+  function setShown(on) {
+    shown = on;
+    if (!on) mesh.visible = false;
+  }
+  function warm(on) {
+    geo.instanceCount = on ? 1 : 0;
+    mesh.visible = on;
+  }
+  return { spawn: spawn, update: update, clear: clear, setShown: setShown, warm: warm };
+})();
+
 const UI = (function () {
   const $ = function (id) { return document.getElementById(id); };
   const el = {
@@ -4977,7 +5345,7 @@ const UI = (function () {
     waveNum: $('wave-num'), kills: $('kill-count'), left: $('enemies-left'),
     bossWrap: $('boss-wrap'), bossFill: $('boss-fill'), bossTrail: $('boss-trail'),
     banner: $('banner'), bannerMain: $('banner-main'), bannerSub: $('banner-sub'),
-    toast: $('toast'), edge: $('edge-flash'), offscreen: $('offscreen'), dmgLayer: $('dmg-layer'),
+    toast: $('toast'), edge: $('edge-flash'), offscreen: $('offscreen'),
     muteInd: $('mute-ind'), modeHint: $('mode-hint'),
     title: $('title-screen'), pause: $('pause-screen'), pauseInstr: $('pause-instr'), pauseNote: $('pause-note'),
     upgrade: $('upgrade-screen'), upgTitle: $('upg-title'), cards: document.querySelectorAll('#cards .card'),
@@ -4989,7 +5357,6 @@ const UI = (function () {
     bannerT: 0, bannerDur: 0, toastT: 0, toastDur: 0, edgeT: 0,
     cache: {},
   };
-  const dmgPool = [];
   const offArrows = [];
 
   function setText(key, node, text) {
@@ -5000,12 +5367,6 @@ const UI = (function () {
   }
 
   function init() {
-    for (let i = 0; i < CONFIG.effects.damageNumbers; i++) {
-      const d = document.createElement('div');
-      d.className = 'dmg';
-      el.dmgLayer.appendChild(d);
-      dmgPool.push({ el: d, active: false, x: 0, y: 0, z: 0, life: 0, maxLife: 1 });
-    }
     for (let i = 0; i < CONFIG.effects.offscreenArrows; i++) {
       const a = document.createElement('div');
       a.className = 'offarrow';
@@ -5032,7 +5393,7 @@ const UI = (function () {
     el.hud.classList.toggle('hidden', state === 'title' || state === 'gameover');
     if (state === 'paused') refreshPauseText();
     if (state !== 'playing') hideOffscreenArrows();
-    el.dmgLayer.style.visibility = state === 'playing' ? 'visible' : 'hidden';
+    DamageText.setShown(state === 'playing');
   }
 
   function refreshPauseText() {
@@ -5094,44 +5455,9 @@ const UI = (function () {
     if (show) { s.bossTrail = 1; s.bossDelay = 0; s.lastBossHp = -1; }
   }
 
-  function damageNumber(x, y, z, value, kind) {
-    let d = null;
-    for (let i = 0; i < dmgPool.length; i++) if (!dmgPool[i].active) { d = dmgPool[i]; break; }
-    if (!d) {
-      d = dmgPool[0];
-      for (let i = 1; i < dmgPool.length; i++) if (dmgPool[i].life < d.life) d = dmgPool[i];
-    }
-    d.active = true;
-    d.x = x + rand(-0.25, 0.25);
-    d.y = y;
-    d.z = z + rand(-0.25, 0.25);
-    d.maxLife = CONFIG.effects.damageNumberLife * (kind === 'big' ? 1.2 : 1);
-    d.life = d.maxLife;
-    d.el.textContent = String(value);
-    d.el.className = 'dmg' + (kind ? ' ' + kind : '');
-    d.el.style.display = 'block';
-  }
-
-  function updateDamageNumbers(dt) {
-    const W = window.innerWidth, H = window.innerHeight;
-    for (let i = 0; i < dmgPool.length; i++) {
-      const d = dmgPool[i];
-      if (!d.active) continue;
-      d.life -= dt;
-      if (d.life <= 0) { d.active = false; d.el.style.display = 'none'; continue; }
-      d.y += CONFIG.effects.damageNumberRise * dt;
-      _v1.set(d.x, d.y, d.z).project(camera);
-      if (_v1.z > 1) { d.el.style.opacity = '0'; continue; }
-      const sx = (_v1.x + 1) * 0.5 * W, sy = (1 - _v1.y) * 0.5 * H;
-      const age = 1 - d.life / d.maxLife;
-      const pop = age < 0.12 ? 1.7 - (age / 0.12) * 0.7 : 1;
-      d.el.style.transform = 'translate(' + sx.toFixed(1) + 'px,' + sy.toFixed(1) + 'px) translate(-50%,-50%) scale(' + pop.toFixed(2) + ')';
-      d.el.style.opacity = String(Math.min(1, (d.life / d.maxLife) * 2.2).toFixed(2));
-    }
-  }
-  function clearDamageNumbers() {
-    for (let i = 0; i < dmgPool.length; i++) { dmgPool[i].active = false; dmgPool[i].el.style.display = 'none'; }
-  }
+  function damageNumber(x, y, z, value, kind) { DamageText.spawn(x, y, z, value, kind); }
+  function updateDamageNumbers(dt) { DamageText.update(dt); }
+  function clearDamageNumbers() { DamageText.clear(); }
 
   function hideOffscreenArrows() {
     for (let i = 0; i < offArrows.length; i++) {
@@ -5197,6 +5523,7 @@ const UI = (function () {
     }
     if (s.edgeT > 0) s.edgeT = Math.max(0, s.edgeT - dt);
     setStyle('edgeO', el.edge, 'opacity', (s.edgeT / CONFIG.effects.edgeFlashTime).toFixed(2));
+    setStyle('edgeV', el.edge, 'visibility', s.edgeT > 0 ? 'visible' : 'hidden');
 
     if (Game.state === 'title') return;
 
@@ -5206,8 +5533,8 @@ const UI = (function () {
     if (s.hpTrail < hpR) s.hpTrail = hpR;
     else if (s.hpDelay > 0) s.hpDelay -= dt;
     else s.hpTrail = Math.max(hpR, s.hpTrail - dt * 0.6);
-    setStyle('hpW', el.hpFill, 'width', (hpR * 100).toFixed(1) + '%');
-    setStyle('hpTW', el.hpTrail, 'width', (s.hpTrail * 100).toFixed(1) + '%');
+    setStyle('hpW', el.hpFill, 'transform', 'scaleX(' + hpR.toFixed(3) + ')');
+    setStyle('hpTW', el.hpTrail, 'transform', 'scaleX(' + s.hpTrail.toFixed(3) + ')');
     setText('hpT', el.hpText, Math.ceil(player.hp) + ' / ' + maxHp);
     // dodge cooldown ring
     const cd = playerDodgeCooldown();
@@ -5227,8 +5554,8 @@ const UI = (function () {
       if (s.bossTrail < r) s.bossTrail = r;
       else if (s.bossDelay > 0) s.bossDelay -= dt;
       else s.bossTrail = Math.max(r, s.bossTrail - dt * 0.5);
-      setStyle('bossW', el.bossFill, 'width', (r * 100).toFixed(1) + '%');
-      setStyle('bossTW', el.bossTrail, 'width', (s.bossTrail * 100).toFixed(1) + '%');
+      setStyle('bossW', el.bossFill, 'transform', 'scaleX(' + r.toFixed(3) + ')');
+      setStyle('bossTW', el.bossTrail, 'transform', 'scaleX(' + s.bossTrail.toFixed(3) + ')');
     }
     updateDamageNumbers(dt * (Game.state === 'playing' ? Math.max(Time.scale, 0.35) : 0));
     updateOffscreenArrows();
@@ -5509,13 +5836,19 @@ function tick(realDt) {
     applyPose(player.rig, player.pose);
   }
   BlobShadows.update();
+  HealthBars.flush();
   sky.position.copy(camera.position);
   UI.update(realDt);
 }
 
 // ---- Dynamic resolution: trade sharpness for frame rate on slow GPUs ----
+// A step down is kept only if it actually raises the frame rate: on a
+// CPU-bound machine fewer pixels don't help, so the picture stays sharp.
 const Perf = {
   acc: 0, frames: 0, smoothT: 0, fps: 60,
+  probe: null,      // { scale, fps } before the step down being judged
+  floor: 0,         // scale not to drop below while floorT > 0
+  floorT: 0,
   sample: function (rawDt) {
     // Ignore stalls (tab switches, alerts) and frames while the game is paused.
     if (!(rawDt > 0) || rawDt > 0.25 || document.hidden) return;
@@ -5528,10 +5861,26 @@ const Perf = {
     this.acc = 0;
     this.frames = 0;
     UI.setFps(this.fps, GFX.scale);
-    if (Game.state !== 'playing' && Game.state !== 'title') return;
+    if (Game.state !== 'playing' && Game.state !== 'title') { this.probe = null; return; }
+    if (this.floorT > 0) this.floorT -= window_;
+    if (this.probe) {
+      const pr = this.probe;
+      this.probe = null;
+      if (this.fps < pr.fps * (1 + G.minGain)) {
+        setRenderScale(pr.scale);
+        this.floor = pr.scale;
+        this.floorT = G.retryTime;
+        this.smoothT = 0;
+        return;
+      }
+    }
     if (this.fps < G.scaleDownFps) {
       this.smoothT = 0;
-      setRenderScale(GFX.scale - G.scaleStepDown);
+      const floor = Math.max(GFX.preset.minScale, this.floorT > 0 ? this.floor : 0);
+      if (GFX.scale - 1e-3 > floor) {
+        this.probe = { scale: GFX.scale, fps: this.fps };
+        setRenderScale(Math.max(floor, GFX.scale - G.scaleStepDown));
+      }
     } else if (this.fps >= G.scaleUpFps) {
       this.smoothT += window_;
       if (this.smoothT >= G.upHoldTime) {
@@ -5586,14 +5935,42 @@ function onResize() {
 }
 
 // Compile every shader up front so the first charge or slam doesn't hitch.
+// Never-disposed materials keep the debris shader variants (opaque and
+// fading) compiled even while no debris is on screen.
+const debrisWarmMats = [debrisMaterial(bodyMaterial(14, 0x202020)), debrisMaterial(bodyMaterial(14, 0x202020))];
+debrisWarmMats[1].transparent = true;
+debrisWarmMats[1].opacity = 0.5;
+
+// Compile AND draw every shader variant once before play. Some drivers
+// (ANGLE on Direct3D) only finish a shader at its first real draw, which
+// would otherwise hitch the first hit, kill, health bar or archer.
 function warmUp() {
-  const bar = createHealthBar(1);
-  bar.group.visible = true;
-  const hidden = [];
-  Effects.forEachWarmable(function (o) { if (!o.visible) { o.visible = true; hidden.push(o); } });
-  try { renderer.compile(scene, camera); } catch (err) { /* compile is only an optimisation */ }
-  for (let i = 0; i < hidden.length; i++) hidden[i].visible = false;
-  scene.remove(bar.group);
+  const temp = [];
+  const pieceGeo = player.rig.root.userData.skin.pieces[0].geo;
+  for (let i = 0; i < debrisWarmMats.length; i++) temp.push(new THREE.Mesh(pieceGeo, debrisWarmMats[i]));
+  const built = [buildGrunt(), buildBrute(false), buildBrute(true), buildArcher()];
+  for (let i = 0; i < built.length; i++) temp.push(built[i].rig.root);
+  const restore = [];
+  for (let i = 0; i < temp.length; i++) {
+    scene.add(temp[i]);
+    temp[i].traverse(function (o) { if (!o.visible) { o.visible = true; restore.push(o); } });
+  }
+  Effects.forEachWarmable(function (o) { if (!o.visible) { o.visible = true; restore.push(o); } });
+  const counts = [HealthBars.mesh, BlobShadows.mesh].filter(Boolean);
+  for (let i = 0; i < counts.length; i++) counts[i].count = 1;
+  DamageText.warm(true);
+  const culled = [];
+  scene.traverse(function (o) { if (o.frustumCulled) { o.frustumCulled = false; culled.push(o); } });
+  try {
+    renderer.compile(scene, camera);
+    renderer.render(scene, camera);
+  } catch (err) { /* warming is only an optimisation */ }
+  for (let i = 0; i < culled.length; i++) culled[i].frustumCulled = true;
+  for (let i = 0; i < counts.length; i++) counts[i].count = 0;
+  DamageText.warm(false);
+  for (let i = 0; i < restore.length; i++) restore[i].visible = false;
+  for (let i = 0; i < temp.length; i++) scene.remove(temp[i]);
+  for (let i = 0; i < built.length; i++) disposeMaterials(built[i].mats);
 }
 
 function init() {
@@ -5620,6 +5997,7 @@ window.__duskPit = {
   pauseGame: pauseGame, resumeGame: resumeGame, playerTakeDamage: playerTakeDamage, onPointerLockChange: onPointerLockChange,
   onLockFailed: onLockFailed, requestLock: requestLock, switchToNoLock: switchToNoLock, Cam: Cam, pillars: pillars, renderer: renderer,
   meleeCap: meleeCap, pressAction: pressAction, GFX: GFX, Perf: Perf, setRenderScale: setRenderScale,
+  scene: scene, camera: camera, renderFrame: function () { renderer.render(scene, camera); }, HealthBars: HealthBars, BlobShadows: BlobShadows,
   step: function (frames, dt) { for (let i = 0; i < frames; i++) tick(dt || 1 / 60); },
 };
 
